@@ -312,20 +312,20 @@ func (m *MQTT) connect(clientID string, handler bindings.Handler, isConsumer boo
 		return nil, err
 	}
 	opts := m.createClientOptions(uri, clientID)
-	var client mqtt.Client
+	var mqttClient mqtt.Client
 	if isConsumer {
 		// For consumers, add the topics we're subscribing to in the OnConnectHandler
 		opts.SetOnConnectHandler(func(client mqtt.Client) {
 			m.logger.Errorf("MQTT error while trying to subscribe to topics; will reconnect. Error: %v", err)
 			client.Disconnect(5)
 			m.connect(clientID, handler, isConsumer)
-			client = mqtt.NewClient(opts)
-			client.Connect()
+			mqttClient = mqtt.NewClient(opts)
+			mqttClient.Connect()
 			m.subscribe(handler)
 		})
 	} else {
-		client = mqtt.NewClient(opts)
-		token := client.Connect()
+		mqttClient = mqtt.NewClient(opts)
+		token := mqttClient.Connect()
 		for !token.WaitTimeout(defaultWait) {
 		}
 		if err := token.Error(); err != nil {
@@ -333,7 +333,7 @@ func (m *MQTT) connect(clientID string, handler bindings.Handler, isConsumer boo
 		}
 	}
 
-	return client, nil
+	return mqttClient, nil
 }
 
 func (m *MQTT) newTLSConfig() *tls.Config {
