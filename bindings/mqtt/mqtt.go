@@ -20,14 +20,16 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net/url"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
 	"github.com/dapr/components-contrib/bindings"
-	"github.com/dapr/components-contrib/internal/utils"
 	"github.com/dapr/kit/logger"
 	"github.com/dapr/kit/retry"
 )
@@ -49,7 +51,6 @@ const (
 	errorMsgPrefix = "mqtt binding error:"
 
 	// Defaults.
-	// TODO: Change QOS and cleanSession defaults to 1 and false
 	defaultQOS          = 0
 	defaultRetain       = false
 	defaultWait         = 3 * time.Second
@@ -69,7 +70,7 @@ type MQTT struct {
 }
 
 // NewMQTT returns a new MQTT instance.
-func NewMQTT(logger logger.Logger) bindings.InputOutputBinding {
+func NewMQTT(logger logger.Logger) *MQTT {
 	return &MQTT{logger: logger}
 }
 
@@ -108,7 +109,11 @@ func parseMQTTMetaData(md bindings.Metadata) (*metadata, error) {
 
 	m.retain = defaultRetain
 	if val, ok := md.Properties[mqttRetain]; ok && val != "" {
-		m.retain = utils.IsTruthy(val)
+		var err error
+		m.retain, err = strconv.ParseBool(val)
+		if err != nil {
+			return &m, fmt.Errorf("%s invalid retain %s, %s", errorMsgPrefix, val, err)
+		}
 	}
 
 	if val, ok := md.Properties[mqttClientID]; ok && val != "" {
@@ -119,7 +124,11 @@ func parseMQTTMetaData(md bindings.Metadata) (*metadata, error) {
 
 	m.cleanSession = defaultCleanSession
 	if val, ok := md.Properties[mqttCleanSession]; ok && val != "" {
-		m.cleanSession = utils.IsTruthy(val)
+		var err error
+		m.cleanSession, err = strconv.ParseBool(val)
+		if err != nil {
+			return &m, fmt.Errorf("%s invalid clean session %s, %s", errorMsgPrefix, val, err)
+		}
 	}
 
 	if val, ok := md.Properties[mqttCACert]; ok && val != "" {
@@ -162,7 +171,7 @@ func (m *MQTT) Init(metadata bindings.Metadata) error {
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	producerClientID := fmt.Sprintf("%s-producer", m.metadata.clientID)
-	p, err := m.connect(nil, producerClientID, nil, false)
+	p, err := m.connect(producerClientID, nil, false)
 	if err != nil {
 		return err
 	}
@@ -213,7 +222,7 @@ func (m *MQTT) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bindin
 	})
 }
 
-func (m *MQTT) handleMessage(ctx context.Context, handler bindings.Handler, mqttMsg mqtt.Message) error {
+func (m *MQTT) handleMessage(handler bindings.Handler, mqttMsg mqtt.Message) error {
 	msg := bindings.ReadResponse{
 		Data:     mqttMsg.Payload(),
 		Metadata: map[string]string{mqttTopic: mqttMsg.Topic()},
@@ -225,7 +234,7 @@ func (m *MQTT) handleMessage(ctx context.Context, handler bindings.Handler, mqtt
 	ch := make(chan error)
 	go func(m *bindings.ReadResponse) {
 		defer close(ch)
-		_, err := handler(ctx, m)
+		_, err := handler(context.TODO(), m)
 		ch <- err
 	}(&msg)
 
@@ -242,42 +251,45 @@ func (m *MQTT) handleMessage(ctx context.Context, handler bindings.Handler, mqtt
 	}
 }
 
-func (m *MQTT) Read(ctx context.Context, handler bindings.Handler) error {
+func (m *MQTT) Read(handler bindings.Handler) error {
+	sigterm := make(chan os.Signal, 1)
+	signal.Notify(sigterm, os.Interrupt, syscall.SIGTERM)
+
 	// reset synchronization
 	if m.consumer != nil {
 		m.logger.Warnf("re-initializing the subscriber")
-		m.consumer.Disconnect(5)
+		m.consumer.Disconnect(0)
 		m.consumer = nil
 	}
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	consumerClientID := fmt.Sprintf("%s-consumer", m.metadata.clientID)
-	c, err := m.connect(ctx, consumerClientID, handler, true)
+	c, err := m.connect(consumerClientID, handler, true)
 	if err != nil {
 		return err
 	}
 	m.consumer = c
 
-	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
-
-	shouldReturn, returnValue := m.subscribe(ctx, handler)
+	shouldReturn, returnValue := m.subscribe(handler)
 	if shouldReturn {
 		return returnValue
 	}
+	<-sigterm
 
 	return nil
 }
 
-func (m *MQTT) subscribe(ctx context.Context, handler bindings.Handler) (bool, error) {
+func (m *MQTT) subscribe(handler bindings.Handler) (bool, error) {
+	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
 	token := m.consumer.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
-		var b backoff.BackOff = backoff.WithContext(m.backOff, ctx)
+		b := m.backOff
 		if m.metadata.backOffMaxRetries >= 0 {
-			b = backoff.WithMaxRetries(b, uint64(m.metadata.backOffMaxRetries))
+			b = backoff.WithMaxRetries(m.backOff, uint64(m.metadata.backOffMaxRetries))
 		}
 
 		if err := retry.NotifyRecover(func() error {
 			m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
-			return m.handleMessage(ctx, handler, mqttMsg)
+			return m.handleMessage(handler, mqttMsg)
 		}, b, func(err error, d time.Duration) {
 			m.logger.Errorf("Error processing MQTT message: %s/%d. Retrying...", mqttMsg.Topic(), mqttMsg.MessageID())
 		}, func() {
@@ -288,12 +300,13 @@ func (m *MQTT) subscribe(ctx context.Context, handler bindings.Handler) (bool, e
 	})
 	if err := token.Error(); err != nil {
 		m.logger.Errorf("mqtt error from subscribe: %v", err)
+
 		return true, err
 	}
 	return false, nil
 }
 
-func (m *MQTT) connect(ctx context.Context, clientID string, handler bindings.Handler, isConsumer bool) (mqtt.Client, error) {
+func (m *MQTT) connect(clientID string, handler bindings.Handler, isConsumer bool) (mqtt.Client, error) {
 	uri, err := url.Parse(m.metadata.url)
 	if err != nil {
 		return nil, err
@@ -305,8 +318,8 @@ func (m *MQTT) connect(ctx context.Context, clientID string, handler bindings.Ha
 		opts.SetConnectionLostHandler(func(client mqtt.Client, err error) {
 			m.logger.Errorf("MQTT error while trying to subscribe to topics; will reconnect. Error: %v", err)
 			client.Disconnect(5)
-			m.connect(ctx, clientID, handler, isConsumer)
-			m.subscribe(ctx, handler)
+			m.connect(clientID, handler, isConsumer)
+			m.subscribe(handler)
 		})
 	}
 	client = mqtt.NewClient(opts)
@@ -347,9 +360,6 @@ func (m *MQTT) createClientOptions(uri *url.URL, clientID string) *mqtt.ClientOp
 	opts := mqtt.NewClientOptions()
 	opts.SetClientID(clientID)
 	opts.SetCleanSession(m.metadata.cleanSession)
-	opts.SetAutoReconnect(true)
-	opts.SetConnectRetry(true)
-	opts.SetConnectRetryInterval(2 * time.Second)
 	// URL scheme backward compatibility
 	scheme := uri.Scheme
 	switch scheme {
@@ -373,9 +383,9 @@ func (m *MQTT) Close() error {
 	m.cancel()
 
 	if m.consumer != nil {
-		m.consumer.Disconnect(5)
+		m.consumer.Disconnect(1)
 	}
-	m.producer.Disconnect(5)
+	m.producer.Disconnect(1)
 
 	return nil
 }
