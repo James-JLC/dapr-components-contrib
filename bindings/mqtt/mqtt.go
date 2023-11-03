@@ -315,19 +315,22 @@ func (m *MQTT) connect(clientID string, handler bindings.Handler, isConsumer boo
 	var client mqtt.Client
 	if isConsumer {
 		// For consumers, add the topics we're subscribing to in the OnConnectHandler
-		opts.SetConnectionLostHandler(func(client mqtt.Client, err error) {
+		opts.SetOnConnectHandler(func(client mqtt.Client) {
 			m.logger.Errorf("MQTT error while trying to subscribe to topics; will reconnect. Error: %v", err)
 			client.Disconnect(5)
 			m.connect(clientID, handler, isConsumer)
+			client = mqtt.NewClient(opts)
+			client.Connect()
 			m.subscribe(handler)
 		})
-	}
-	client = mqtt.NewClient(opts)
-	token := client.Connect()
-	for !token.WaitTimeout(defaultWait) {
-	}
-	if err := token.Error(); err != nil {
-		return nil, err
+	} else {
+		client = mqtt.NewClient(opts)
+		token := client.Connect()
+		for !token.WaitTimeout(defaultWait) {
+		}
+		if err := token.Error(); err != nil {
+			return nil, err
+		}
 	}
 
 	return client, nil
@@ -360,6 +363,9 @@ func (m *MQTT) createClientOptions(uri *url.URL, clientID string) *mqtt.ClientOp
 	opts := mqtt.NewClientOptions()
 	opts.SetClientID(clientID)
 	opts.SetCleanSession(m.metadata.cleanSession)
+	opts.SetAutoReconnect(true)
+	opts.SetConnectRetry(true)
+	opts.SetConnectRetryInterval(2 * time.Second)
 	// URL scheme backward compatibility
 	scheme := uri.Scheme
 	switch scheme {
