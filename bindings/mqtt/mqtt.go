@@ -162,7 +162,7 @@ func (m *MQTT) Init(metadata bindings.Metadata) error {
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	producerClientID := fmt.Sprintf("%s-producer", m.metadata.clientID)
-	p, err := m.connect(producerClientID)
+	p, err := m.connect(nil, producerClientID, nil, false)
 	if err != nil {
 		return err
 	}
@@ -252,13 +252,23 @@ func (m *MQTT) Read(ctx context.Context, handler bindings.Handler) error {
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	consumerClientID := fmt.Sprintf("%s-consumer", m.metadata.clientID)
-	c, err := m.connect(consumerClientID)
+	c, err := m.connect(ctx, consumerClientID, handler, true)
 	if err != nil {
 		return err
 	}
 	m.consumer = c
 
 	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
+
+	shouldReturn, returnValue := m.subscribe(ctx, handler)
+	if shouldReturn {
+		return returnValue
+	}
+
+	return nil
+}
+
+func (m *MQTT) subscribe(ctx context.Context, handler bindings.Handler) (bool, error) {
 	token := m.consumer.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
 		var b backoff.BackOff = backoff.WithContext(m.backOff, ctx)
 		if m.metadata.backOffMaxRetries >= 0 {
@@ -278,19 +288,28 @@ func (m *MQTT) Read(ctx context.Context, handler bindings.Handler) error {
 	})
 	if err := token.Error(); err != nil {
 		m.logger.Errorf("mqtt error from subscribe: %v", err)
-		return err
+		return true, err
 	}
-
-	return nil
+	return false, nil
 }
 
-func (m *MQTT) connect(clientID string) (mqtt.Client, error) {
+func (m *MQTT) connect(ctx context.Context, clientID string, handler bindings.Handler, isConsumer bool) (mqtt.Client, error) {
 	uri, err := url.Parse(m.metadata.url)
 	if err != nil {
 		return nil, err
 	}
 	opts := m.createClientOptions(uri, clientID)
-	client := mqtt.NewClient(opts)
+	var client mqtt.Client
+	if isConsumer {
+		// For consumers, add the topics we're subscribing to in the OnConnectHandler
+		opts.SetConnectionLostHandler(func(client mqtt.Client, err error) {
+			m.logger.Errorf("MQTT error while trying to subscribe to topics; will reconnect. Error: %v", err)
+			client.Disconnect(5)
+			m.connect(ctx, clientID, handler, isConsumer)
+			m.subscribe(ctx, handler)
+		})
+	}
+	client = mqtt.NewClient(opts)
 	token := client.Connect()
 	for !token.WaitTimeout(defaultWait) {
 	}
@@ -328,6 +347,9 @@ func (m *MQTT) createClientOptions(uri *url.URL, clientID string) *mqtt.ClientOp
 	opts := mqtt.NewClientOptions()
 	opts.SetClientID(clientID)
 	opts.SetCleanSession(m.metadata.cleanSession)
+	opts.SetAutoReconnect(true)
+	opts.SetConnectRetry(true)
+	opts.SetConnectRetryInterval(2 * time.Second)
 	// URL scheme backward compatibility
 	scheme := uri.Scheme
 	switch scheme {
