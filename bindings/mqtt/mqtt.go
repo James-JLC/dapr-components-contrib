@@ -18,11 +18,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -59,14 +61,16 @@ const (
 
 // MQTT allows sending and receiving data to/from an MQTT broker.
 type MQTT struct {
-	producer mqtt.Client
-	consumer mqtt.Client
-	metadata *metadata
-	logger   logger.Logger
+	producer    mqtt.Client
+	consumer    mqtt.Client
+	metadata    *metadata
+	logger      logger.Logger
+	readHandler bindings.Handler
 
 	ctx     context.Context
 	cancel  context.CancelFunc
 	backOff backoff.BackOff
+	wg      sync.WaitGroup
 }
 
 // NewMQTT returns a new MQTT instance.
@@ -171,7 +175,7 @@ func (m *MQTT) Init(metadata bindings.Metadata) error {
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	producerClientID := fmt.Sprintf("%s-producer", m.metadata.clientID)
-	p, err := m.connect(producerClientID, nil, false)
+	p, err := m.connect(producerClientID, false)
 	if err != nil {
 		return err
 	}
@@ -261,73 +265,34 @@ func (m *MQTT) Read(handler bindings.Handler) error {
 		m.consumer.Disconnect(0)
 		m.consumer = nil
 	}
+	// Store the handler in the object
+	m.readHandler = handler
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	consumerClientID := fmt.Sprintf("%s-consumer", m.metadata.clientID)
-	c, err := m.connect(consumerClientID, handler, true)
+	c, err := m.connect(consumerClientID, true)
 	if err != nil {
 		return err
 	}
 	m.consumer = c
 
-	shouldReturn, returnValue := m.subscribe(handler)
-	if shouldReturn {
-		return returnValue
-	}
 	<-sigterm
 
 	return nil
 }
 
-func (m *MQTT) subscribe(handler bindings.Handler) (bool, error) {
-	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
-	token := m.consumer.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
-		b := m.backOff
-		if m.metadata.backOffMaxRetries >= 0 {
-			b = backoff.WithMaxRetries(m.backOff, uint64(m.metadata.backOffMaxRetries))
-		}
-
-		if err := retry.NotifyRecover(func() error {
-			m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
-			return m.handleMessage(handler, mqttMsg)
-		}, b, func(err error, d time.Duration) {
-			m.logger.Errorf("Error processing MQTT message: %s/%d. Retrying...", mqttMsg.Topic(), mqttMsg.MessageID())
-		}, func() {
-			m.logger.Infof("Successfully processed MQTT message after it previously failed: %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
-		}); err != nil {
-			m.logger.Errorf("Failed processing MQTT message: %s/%d: %v", mqttMsg.Topic(), mqttMsg.MessageID(), err)
-		}
-	})
-	if err := token.Error(); err != nil {
-		m.logger.Errorf("mqtt error from subscribe: %v", err)
-
-		return true, err
-	}
-	return false, nil
-}
-
-func (m *MQTT) connect(clientID string, handler bindings.Handler, isConsumer bool) (mqtt.Client, error) {
+func (m *MQTT) connect(clientID string, isConsumer bool) (mqtt.Client, error) {
 	uri, err := url.Parse(m.metadata.url)
 	if err != nil {
 		return nil, err
 	}
-	opts := m.createClientOptions(uri, clientID)
-	var client mqtt.Client
+	var opts *mqtt.ClientOptions
 	if isConsumer {
-		// For consumers, add the topics we're subscribing to in the OnConnectHandler
-		opts.SetConnectionLostHandler(func(client mqtt.Client, err error) {
-			m.logger.Errorf("MQTT error while trying to subscribe to topics; will reconnect. Error: %v", err)
-			client.Disconnect(5)
-			for {
-				_, err = m.connect(clientID, handler, isConsumer)
-				if err != nil {
-					m.subscribe(handler)
-					break
-				}
-			}
-		})
+		opts = m.createSubscriberClientOptions(uri, clientID)
+	} else {
+		opts = m.createClientOptions(uri, clientID)
 	}
-	client = mqtt.NewClient(opts)
+	client := mqtt.NewClient(opts)
 	token := client.Connect()
 	for !token.WaitTimeout(defaultWait) {
 	}
@@ -338,6 +303,48 @@ func (m *MQTT) connect(clientID string, handler bindings.Handler, isConsumer boo
 	return client, nil
 }
 
+// Extends createClientOptions with options for subscribers only
+func (m *MQTT) createSubscriberClientOptions(uri *url.URL, clientID string) *mqtt.ClientOptions {
+	opts := m.createClientOptions(uri, clientID)
+
+	// On (re-)connection, add the topic subscription
+	opts.OnConnect = func(c mqtt.Client) {
+		token := c.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
+			b := m.backOff
+			if m.metadata.backOffMaxRetries >= 0 {
+				b = backoff.WithMaxRetries(m.backOff, uint64(m.metadata.backOffMaxRetries))
+			}
+
+			if err := retry.NotifyRecover(func() error {
+				m.logger.Debugf("Processing MQTT message %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
+				return m.handleMessage(m.readHandler, mqttMsg)
+			}, b, func(err error, d time.Duration) {
+				m.logger.Errorf("Error processing MQTT message: %s/%d. Retrying...", mqttMsg.Topic(), mqttMsg.MessageID())
+			}, func() {
+				m.logger.Infof("Successfully processed MQTT message after it previously failed: %s/%d", mqttMsg.Topic(), mqttMsg.MessageID())
+			}); err != nil {
+				m.logger.Errorf("Failed processing MQTT message: %s/%d: %v", mqttMsg.Topic(), mqttMsg.MessageID(), err)
+			}
+		})
+
+		var err error
+		select {
+		case <-token.Done():
+			// Subscription went through (sucecessfully or not)
+			err = token.Error()
+		case <-time.After(defaultWait):
+			err = errors.New("timed out waiting for subscription to complete")
+		}
+
+		// Nothing we can do in case of errors besides logging them
+		// If we get here, the connection is almost likely broken anyways, so the client will attempt a reconnection soon if it hasn't already
+		if err != nil {
+			m.logger.Errorf("Error starting subscriptions in the OnConnect handler: %v", err)
+		}
+	}
+
+	return opts
+}
 func (m *MQTT) newTLSConfig() *tls.Config {
 	tlsConfig := new(tls.Config)
 
@@ -362,12 +369,27 @@ func (m *MQTT) newTLSConfig() *tls.Config {
 }
 
 func (m *MQTT) createClientOptions(uri *url.URL, clientID string) *mqtt.ClientOptions {
-	opts := mqtt.NewClientOptions()
-	opts.SetClientID(clientID)
-	opts.SetCleanSession(m.metadata.cleanSession)
-	opts.SetAutoReconnect(true)
-	opts.SetConnectRetry(true)
-	opts.SetConnectRetryInterval(2 * time.Second)
+	opts := mqtt.NewClientOptions().
+		SetClientID(clientID).
+		SetCleanSession(m.metadata.cleanSession).
+		// If OrderMatters is true (default), handlers must not block, which is not an option for us
+		SetOrderMatters(false).
+		// Disable automatic ACKs as we need to do it manually
+		// SetAutoAckDisabled(true).
+		// Configure reconnections
+		SetResumeSubs(true).
+		SetAutoReconnect(true).
+		SetConnectRetry(true).
+		SetConnectRetryInterval(20 * time.Second)
+
+	opts.OnConnectionLost = func(c mqtt.Client, err error) {
+		m.logger.Errorf("Connection with broker with client ID '%s' lost; error: %v", clientID, err)
+	}
+
+	opts.OnReconnecting = func(c mqtt.Client, co *mqtt.ClientOptions) {
+		m.logger.Infof("Attempting to reconnect to broker with client ID '%s'…", clientID)
+	}
+
 	// URL scheme backward compatibility
 	scheme := uri.Scheme
 	switch scheme {
